@@ -91,13 +91,15 @@ async function flip() {
   }
 
   try {
+    log(`Telling the house you're calling ${selectedCall.toUpperCase()}…`);
+    await client.intent('dm', { to: HOUSE_NAMETAG, message: selectedCall });
+
     log(`Placing bet: ${stake} UCT on ${selectedCall.toUpperCase()}…`);
     const amountSmallestUnit = BigInt(Math.round(Number(stake) * 1e18)).toString();
     const result = await client.intent('send', {
       to: HOUSE_NAMETAG,
       amount: amountSmallestUnit,
       coinId: uctCoinId,
-      memo: selectedCall,
     });
     log(`Bet placed (${result?.status || 'submitted'}). Check your Sphere chat with ${HOUSE_NAMETAG} for the result in a few seconds!`);
 

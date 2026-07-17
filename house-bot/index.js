@@ -33,6 +33,13 @@ function smallestToHuman(s) {
   return Number(BigInt(s)) / 1e18;
 }
 
+// Sphere Connect's "send" intent does not forward a custom memo field through to the
+// settled transfer, so we can't rely on memo to know the player's call. Instead, the
+// player DMs their call ("heads"/"tails") first, then sends the stake — we correlate
+// the two by sender identity, with a short expiry so stale calls don't apply to a later bet.
+const pendingCalls = new Map(); // key: senderNametag or senderPubkey -> { call, expiresAt }
+const PENDING_CALL_TTL_MS = 2 * 60 * 1000; // 2 minutes
+
 async function main() {
   console.log('Starting Coin Flip house bot...');
 
@@ -77,21 +84,40 @@ async function main() {
 
   console.log('House identity:', sphere.identity?.nametag ?? sphere.identity?.address);
 
+  sphere.communications.onDirectMessage((msg) => {
+    const key = msg.senderNametag || msg.senderPubkey;
+    if (!key) return;
+    const call = (msg.content || '').trim().toLowerCase();
+    if (call === 'heads' || call === 'tails') {
+      pendingCalls.set(key, { call, expiresAt: Date.now() + PENDING_CALL_TTL_MS });
+      console.log(`Registered call "${call}" from ${msg.senderNametag ? '@' + msg.senderNametag : key}`);
+    }
+  });
+
   await sphere.payments.receive(undefined, (t) => processTransfer(t).catch((e) => console.error('processTransfer error:', e)));
   console.log('Current balance:', await sphere.payments.getAssets());
 
   async function processTransfer(transfer) {
+    const key = transfer.senderNametag || transfer.senderPubkey;
+    if (!key) {
+      console.log('Ignoring a deposit with no resolvable sender identity (likely a stale/legacy transfer).');
+      return;
+    }
     const from = transfer.senderNametag ? `@${transfer.senderNametag}` : transfer.senderPubkey;
     const uctToken = transfer.tokens?.find((t) => t.symbol === 'UCT');
     if (!uctToken) return; // ignore non-UCT deposits
 
     const stakeHuman = smallestToHuman(uctToken.amount);
-    const call = (transfer.memo || '').trim().toLowerCase();
-    console.log(`Bet received from ${from}: ${stakeHuman} UCT, call="${call}"`);
+
+    const pending = pendingCalls.get(key);
+    const call = pending && pending.expiresAt > Date.now() ? pending.call : null;
+    pendingCalls.delete(key);
+
+    console.log(`Bet received from ${from}: ${stakeHuman} UCT, call="${call || '(none)'}"`);
 
     // Validate call
-    if (call !== 'heads' && call !== 'tails') {
-      await refund(from, uctToken.amount, 'Invalid bet — memo must be exactly "heads" or "tails". Refunding your stake.');
+    if (!call) {
+      await refund(from, uctToken.amount, 'No valid "heads"/"tails" call found for this stake (DM your call *before* sending UCT next time). Refunding your stake.');
       return;
     }
 
@@ -138,6 +164,10 @@ async function main() {
   }
 
   async function refund(from, amountSmallest, reasonMsg) {
+    if (!from) {
+      console.log('Skipping refund — no resolvable recipient identity.');
+      return;
+    }
     try {
       await sphere.payments.send({ recipient: from, amount: amountSmallest, coinId: 'UCT', memo: 'Refund' });
       await sphere.communications.sendDM(from, `↩️ ${reasonMsg}`);
@@ -154,7 +184,7 @@ async function main() {
     }
   }, 10000);
 
-  console.log(`House bot is live. Send ${MIN_STAKE}-${MAX_STAKE} UCT to @${NAMETAG} with memo "heads" or "tails" to play.`);
+  console.log(`House bot is live. DM "heads" or "tails" to @${NAMETAG}, then send ${MIN_STAKE}-${MAX_STAKE} UCT within 2 minutes to play.`);
   const startupLedger = loadLedger();
   console.log(`Today's payout so far: ${startupLedger.totalPaidOut}/${DAILY_PAYOUT_CAP_HUMAN} UCT.`);
 
