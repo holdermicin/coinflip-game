@@ -40,6 +40,21 @@ function smallestToHuman(s) {
 const pendingCalls = new Map(); // key: senderNametag or senderPubkey -> { call, expiresAt }
 const PENDING_CALL_TTL_MS = 2 * 60 * 1000; // 2 minutes
 
+// --- Processed-deposit tracker (persisted) so getHistory()-based detection never double-processes ---
+const PROCESSED_PATH = './wallet-data/processed-deposits.json';
+function loadProcessed() {
+  try {
+    return new Set(JSON.parse(fs.readFileSync(PROCESSED_PATH, 'utf8')));
+  } catch (_) {
+    return new Set();
+  }
+}
+function saveProcessed(set) {
+  fs.mkdirSync('./wallet-data', { recursive: true });
+  fs.writeFileSync(PROCESSED_PATH, JSON.stringify([...set]));
+}
+const processedDeposits = loadProcessed();
+
 async function main() {
   console.log('Starting Coin Flip house bot...');
 
@@ -89,24 +104,44 @@ async function main() {
     if (!key) return;
     const call = (msg.content || '').trim().toLowerCase();
     if (call === 'heads' || call === 'tails') {
-      pendingCalls.set(key, { call, expiresAt: Date.now() + PENDING_CALL_TTL_MS });
+      pendingCalls.set(key, { call, expiresAt: Date.now() + PENDING_CALL_TTL_MS, registeredAt: Date.now() });
       console.log(`Registered call "${call}" from ${msg.senderNametag ? '@' + msg.senderNametag : key}`);
     }
   });
 
   await sphere.payments.receive(undefined, (t) => processTransfer(t).catch((e) => console.error('processTransfer error:', e)));
   console.log('Current balance:', await sphere.payments.getAssets());
+  await scanHistoryForDeposits();
 
   async function processTransfer(transfer) {
-    const key = transfer.senderNametag || transfer.senderPubkey;
-    if (!key) {
-      console.log('Ignoring a deposit with no resolvable sender identity (likely a stale/legacy transfer).');
-      return;
-    }
-    const from = transfer.senderNametag ? `@${transfer.senderNametag}` : transfer.senderPubkey;
+    let key = transfer.senderNametag || transfer.senderPubkey;
     const uctToken = transfer.tokens?.find((t) => t.symbol === 'UCT');
     if (!uctToken) return; // ignore non-UCT deposits
 
+    // Sphere Connect's "send" intent sometimes settles without carrying sender identity
+    // through to the recipient (unlike direct SDK-to-SDK sends). When that happens, fall
+    // back to attributing the deposit to the oldest still-valid pending call — since the
+    // player already told us who they are via DM (which always carries proper identity),
+    // and only one bet is expected in flight per player at a time for this demo.
+    if (!key) {
+      let oldestKey = null;
+      let oldestTs = Infinity;
+      for (const [k, v] of pendingCalls.entries()) {
+        if (v.expiresAt > Date.now() && v.registeredAt < oldestTs) {
+          oldestTs = v.registeredAt;
+          oldestKey = k;
+        }
+      }
+      if (oldestKey) {
+        console.log(`Deposit had no resolvable sender identity — attributing it to the oldest pending call, from ${oldestKey}.`);
+        key = oldestKey;
+      } else {
+        console.log('Ignoring a deposit with no resolvable sender identity and no pending call to match it to (likely a stale/legacy transfer).');
+        return;
+      }
+    }
+
+    const from = key.startsWith('npub') || key.length > 30 ? key : `@${key}`; // nametags are short; pubkeys/npubs are long
     const stakeHuman = smallestToHuman(uctToken.amount);
 
     const pending = pendingCalls.get(key);
@@ -176,13 +211,38 @@ async function main() {
     }
   }
 
+  async function scanHistoryForDeposits() {
+    let entries;
+    try {
+      entries = sphere.payments.getHistory();
+    } catch (err) {
+      console.warn('getHistory() failed:', err.message);
+      return;
+    }
+    const newDeposits = entries.filter(
+      (e) => e.type === 'RECEIVED' && e.symbol === 'UCT' && !processedDeposits.has(e.dedupKey)
+    );
+    for (const entry of newDeposits) {
+      processedDeposits.add(entry.dedupKey);
+      await processTransfer({
+        senderNametag: entry.senderNametag,
+        senderPubkey: entry.senderPubkey,
+        memo: entry.memo,
+        tokens: [{ symbol: 'UCT', amount: entry.amount }],
+      }).catch((e) => console.error('processTransfer error:', e));
+    }
+    if (newDeposits.length) saveProcessed(processedDeposits);
+  }
+
   setInterval(async () => {
     try {
-      await sphere.payments.receive(undefined, (t) => processTransfer(t).catch((e) => console.error('processTransfer error:', e)));
+      const { transfers } = await sphere.payments.receive(undefined, (t) => processTransfer(t).catch((e) => console.error('processTransfer error:', e)));
+      await scanHistoryForDeposits();
+      console.log(`[poll] receive()=${transfers?.length || 0}, history scan done.`);
     } catch (err) {
-      console.warn('Polling receive() failed:', err.message);
+      console.warn('Polling failed:', err.message);
     }
-  }, 10000);
+  }, 5000);
 
   console.log(`House bot is live. DM "heads" or "tails" to @${NAMETAG}, then send ${MIN_STAKE}-${MAX_STAKE} UCT within 2 minutes to play.`);
   const startupLedger = loadLedger();
